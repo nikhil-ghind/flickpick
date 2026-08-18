@@ -2,6 +2,77 @@
 
 Two-tower neural retrieval + LightGBM ranking, served in real time. FAISS ANN candidate generation, Redis online feature store, Kafka implicit-feedback streams, A/B experimentation with always-valid p-values, and canary rollout with auto-rollback on metric regression.
 
+## Architecture
+
+```mermaid
+flowchart TB
+    subgraph online["Online serving — RecommendationPipeline.recommend"]
+        REQ["POST /recommend<br/>user_id, num_results, exclude_item_ids, context"]
+        REQ --> UF["feature_store.get_user_features + get_watch_history"]
+        UF --> ENC["_encode_user<br/>user tower over features, history and context"]
+        ENC --> ANN["faiss_index.search<br/>top num_candidates by inner product"]
+        ANN --> EXC["drop exclude_item_ids"]
+        EXC --> IF["feature_store.get_batch_item_features"]
+        IF --> RF["_build_ranker_features<br/>user x item cross features + retrieval score"]
+        RF --> RK["ranker.rank<br/>LightGBM, keeps 2x num_results"]
+        RK --> DIV["_diversify<br/>caps repeats per genre/category"]
+        DIV --> RES["RecommendationResult<br/>items, latency_ms, model_version, candidates_retrieved"]
+    end
+
+    subgraph stores["State"]
+        RD[("Redis feature store<br/>user, item and real-time features")]
+        FA[("FAISS index<br/>item embeddings")]
+        PGDB[("Postgres — flickpick/data/schema.sql")]
+    end
+    UF --> RD
+    IF --> RD
+    ANN --> FA
+
+    subgraph offline["Offline / batch"]
+        TT["two_tower.py<br/>trained with in-batch negatives"]
+        TR["trainer.py"]
+        BC["batch_compute.py<br/>materializes batch features into Redis"]
+        MR["model_registry.py<br/>versioned model artifacts"]
+    end
+    TR --> TT
+    TT --> FA
+    TT --> MR
+    MR --> ENC
+    MR --> RK
+    BC --> RD
+    PGDB --> BC
+
+    subgraph stream["Streaming feedback"]
+        KAF[("Kafka topic user-interactions")] --> EC["EventConsumer<br/>_update_user_realtime writes fresh signals to Redis,<br/>_record_experiment_metrics feeds running experiments"]
+        EC --> RD
+        EC --> EXPR
+    end
+
+    subgraph exp["Experimentation"]
+        EXPR["ABExperiment<br/>deterministic variant assignment by user_id hash,<br/>mSPRT always-valid p-values, guardrail checks"]
+        CAN["CanaryRollout<br/>get_model_version routes each user by stage"]
+        DASH["dashboard/metrics.py<br/>experiment results + recommendation diversity"]
+    end
+    EXPR --> CAN
+    EXPR --> DASH
+    CAN --> RES
+```
+
+Canary rollout is a state machine over traffic share, with a guardrail check on every advance:
+
+```mermaid
+stateDiagram-v2
+    [*] --> CANARY: 5% of users on the new model
+    CANARY --> PARTIAL: guardrails clean and 1h elapsed — 25%
+    PARTIAL --> MAJORITY: guardrails clean and 2h elapsed — 50%
+    MAJORITY --> FULL: guardrails clean and 4h elapsed — 100%
+    FULL --> [*]: experiment concluded
+    CANARY --> ROLLED_BACK: any guardrail violation
+    PARTIAL --> ROLLED_BACK: any guardrail violation
+    MAJORITY --> ROLLED_BACK: any guardrail violation
+    ROLLED_BACK --> [*]: all traffic back on the old version
+```
+
 ## What it is
 
 - **Retrieval** (`flickpick/models/two_tower.py`): two-tower (user, item) encoder trained with in-batch negatives.
